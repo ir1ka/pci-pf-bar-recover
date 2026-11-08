@@ -1,0 +1,27 @@
+Source: pci-pf-bar-recover
+Section: kernel
+Priority: optional
+Maintainer: IriKa Qiu <qiujie.jq@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-sequence-dkms, python3, git
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/ir1ka/pci-pf-bar-recover
+Vcs-Git: https://github.com/ir1ka/pci-pf-bar-recover.git
+Vcs-Browser: https://github.com/ir1ka/pci-pf-bar-recover
+
+Package: pci-pf-bar-recover-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms (>= 3.0), python3, kmod, xz-utils, zstd, gzip, coreutils, sed, grep, findutils, gawk | mawk
+Recommends: linux-headers-generic | linux-headers-amd64, pahole, initramfs-tools
+Conflicts: pci-pf-bar-recover-prebuilt
+Replaces: pci-pf-bar-recover-prebuilt
+Description: best-effort physical PCI BAR recovery using DKMS
+ Probes and restores missing physical BARs on unused PCI functions without
+ requiring a particular device model or a particular failure cause.
+ Defaults to all PCI devices, with an optional root-port list restriction.
+ Device failures are logged and skipped; other devices continue.
+ Active devices are not relocated; idle subtrees may rebalance windows.
+ Default CMP large-BAR preparation is restricted to NVIDIA 20c2/2082.
+ Module loading is inert unless execute=1 is explicitly supplied.
+ An optional pre-udev initramfs action requires explicit user opt-in.
+ Installing this package does not enable the early action.

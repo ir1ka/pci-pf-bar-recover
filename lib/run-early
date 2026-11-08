@@ -1,0 +1,51 @@
+#!/bin/sh
+# Explicitly opted-in initramfs action. Failure must not suppress normal udev.
+set -u
+PATH=${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+export PATH
+log() { echo "pci-pf-bar early rebalance: $*" >&2; }
+# Reuse the image's existing applets; no private binaries or kmod extensions.
+for tool in insmod rmmod cat grep sed mkdir chmod; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        log "required system command missing: $tool; skipped"; exit 0;
+    }
+done
+case " $(cat /proc/cmdline) " in
+    *' pci_pf_bar_rebalance=off '*) log 'bypassed by kernel command line'; exit 0;;
+esac
+[ -r /conf/pci-pf-bar-rebalance ] || exit 0
+ports=$(cat /conf/pci-pf-bar-rebalance)
+ensure_id=
+[ ! -r /conf/pci-pf-bar-ensure-id ] || ensure_id=$(cat /conf/pci-pf-bar-ensure-id)
+if [ -n "$ensure_id" ]; then
+    [ -z "$ports" ] && printf '%s\n' "$ensure_id" | grep -Eq '^[[:xdigit:]]{4}:[[:xdigit:]]{4}$' || {
+        log 'invalid ensure-id or mixed scopes; skipped'; exit 0;
+    }
+    set -- "ensure_id=$ensure_id"
+else
+    [ -n "$ports" ] || { log 'empty port list; skipped'; exit 0; }
+    set -- "ports=$ports"
+fi
+if [ -d /sys/module/pci_pf_bar_recover ]; then
+    if [ "$(cat /sys/module/pci_pf_bar_recover/parameters/execute 2>/dev/null)" = N ]; then
+        rmmod pci_pf_bar_recover || { log 'cannot unload idle module; skipped'; exit 0; }
+    else
+        log 'an executing recovery module is already loaded; skipped'
+        exit 0
+    fi
+fi
+log "automatic PF BAR recovery for ${ensure_id:-$ports}, before udev"
+if insmod /lib/pci-pf-bar-recover/pci_pf_bar_recover.ko execute=1 "$@"; then
+    # Capture bounded kernel records before unload; failure never blocks udev.
+    if [ -r /sys/module/pci_pf_bar_recover/parameters/result_records ]; then
+        mkdir -p /run/pci-pf-bar-recover
+        (umask 077; cat /sys/module/pci_pf_bar_recover/parameters/result_records > /run/pci-pf-bar-recover/boot-records.jsonl) || log 'cannot save result records'
+        cat /sys/module/pci_pf_bar_recover/parameters/result_records >&2
+        log "result records dropped=$(cat /sys/module/pci_pf_bar_recover/parameters/result_dropped)"
+    fi
+    rmmod pci_pf_bar_recover || log 'module unload failed'
+    log 'scan complete; see kernel log for committed/skipped/rollback results'
+else
+    log 'module execution failed; proceeding with normal udev'
+fi
+exit 0

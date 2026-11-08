@@ -1,0 +1,23 @@
+#!/bin/sh
+# Build-time only: stage this project's module, never shell/kmod/tool binaries.
+set -eu
+runtime_error() { echo "E: initramfs module staging: $*" >&2; exit 1; }
+module=pci_pf_bar_recover
+# Direct insmod is portable across BusyBox and kmod. These modules have no
+# loadable dependencies; refuse an unexpected dependency instead of ignoring it.
+[ -z "$(modinfo -k "$version" -F depends "$module")" ] || runtime_error 'unexpected module dependencies'
+source_module=$(modinfo -k "$version" -F filename "$module")
+[ -f "$source_module" ] || runtime_error 'target module not found'
+mkdir -p "$DESTDIR/lib/pci-pf-bar-recover"
+target_module="$DESTDIR/lib/pci-pf-bar-recover/$module.ko"
+# Decompress at image-build time, preserving the module/signature byte stream.
+# Runtime BusyBox need not support any compression format or depmod index.
+case "$source_module" in
+ *.ko) cp "$source_module" "$target_module";;
+ *.ko.xz) xz -dc "$source_module" > "$target_module";;
+ *.ko.zst) zstd -dc "$source_module" > "$target_module";;
+ *.ko.gz) gzip -dc "$source_module" > "$target_module";;
+ *) runtime_error 'unsupported module compression';;
+esac
+[ -s "$target_module" ] || runtime_error 'empty staged module'
+chmod 644 "$target_module"

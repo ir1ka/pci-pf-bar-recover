@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: pci-pf-bar-recover
+Source: https://github.com/ir1ka/pci-pf-bar-recover
+
+Files: *
+Copyright: 2026 IriKa Qiu
+License: GPL-2
+ This package is licensed under the GNU General Public License version 2.
+ On Debian systems the full text is in /usr/share/common-licenses/GPL-2.

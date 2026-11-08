@@ -1,0 +1,135 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "GENERIC-TEST FAIL: $*"; poweroff -f; exit 1; }
+bar_ok() { awk 'NR==1 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' "/sys/bus/pci/devices/$1/resource"; }
+insmod /modules/i2c-algo-bit.ko || fail i2c
+insmod /modules/dca.ko || fail dca
+insmod /modules/igb.ko || fail igb
+for bdf in 0000:04:00.0 0000:07:00.0 0000:08:00.0; do
+ echo "$bdf" > /sys/bus/pci/drivers/igb/unbind || fail unbind
+ # Driver removal can leave VF ranges allocated, which the module must drop.
+done
+[ -L /sys/bus/pci/devices/0000:01:00.0/driver ] || fail 'protected device driver missing'
+cat /sys/bus/pci/devices/0000:01:00.0/resource > /protected-before
+# Linux 7.x represents unused typed windows with DISABLED and a 0..0 range.
+# An empty bridge reproduces the bogus-alignment failure from the B760 report.
+insmod /modules/empty_bridge_fixture.ko || fail empty-fixture
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 debug=1 ports=0000:00:05.0 || fail empty-load
+rmmod pci_pf_bar_recover || fail empty-unload
+dmesg | grep -q '0000:00:05.0: rebalance: COMMITTED' || fail 'empty disabled bridge windows aborted transaction'
+if dmesg | grep -q 'bogus alignment'; then fail 'disabled window was assigned'; fi
+rmmod empty_bridge_fixture || fail empty-fixture-unload
+echo 'REBALANCE-TEST empty disabled bridge windows skipped without bogus alignment'
+insmod /modules/fault_fixture.ko || fail fixture
+for bdf in 0000:04:00.0 0000:07:00.0 0000:08:00.0; do
+ if bar_ok "$bdf"; then fail 'fixture failed to erase descriptor'; fi
+done
+insmod /modules/pci_pf_bar_recover.ko || fail 'idle load'
+[ "$(cat /sys/module/pci_pf_bar_recover/parameters/execute)" = N ] || fail 'idle execution gate'
+if bar_ok 0000:04:00.0; then fail 'plain module load changed resources'; fi
+rmmod pci_pf_bar_recover || fail 'idle unload'
+echo 'GENERIC-TEST idle load makes no resource changes'
+if insmod /modules/pci_pf_bar_recover.ko execute=1 debug=1 debug_limit=0 ports=0000:00:03.1; then fail 'zero debug budget accepted'; fi
+if bar_ok 0000:04:00.0; then fail 'invalid debug argument changed resources'; fi
+insmod /modules/pci_pf_bar_recover.ko execute=1 debug=1 debug_limit=2048 ports=0000:00:03.1 || fail scoped
+[ "$(cat /sys/module/pci_pf_bar_recover/parameters/restored)" -ge 1 ] || fail 'missing restored counter'
+[ "$(cat /sys/module/pci_pf_bar_recover/parameters/failed)" -ge 1 ] || fail 'missing failed counter'
+echo 'GENERIC-TEST live counters report restored and failed candidates'
+dmesg | grep -q 'stage=probe-mask' || fail 'probe trace missing'
+dmesg | grep -q 'stage=pf-assign' || fail 'allocation trace missing'
+echo 'DEBUG-TEST scoped trace includes sizing and allocation results'
+rmmod pci_pf_bar_recover || fail unload
+bar_ok 0000:04:00.0 || fail 'eligible scoped PF not recovered'
+if bar_ok 0000:07:00.0; then fail 'blocked PF unexpectedly allocated'; fi
+if bar_ok 0000:08:00.0; then fail 'outside scoped root was changed'; fi
+awk 'NR==3 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource || fail '64-bit BAR or new bridge window not recovered'
+echo 'GENERIC-TEST 64-bit BAR and previously missing bridge windows recovered'
+echo 'GENERIC-TEST scoped root recovers usable PF, skips exhausted PF, leaves outside untouched'
+insmod /modules/pci_pf_bar_recover.ko execute=1 debug=1 debug_limit=1 || fail global
+dmesg | grep -Eq 'end rc=0 records=1 dropped=[1-9]' || fail 'debug budget did not cap trace'
+echo 'DEBUG-TEST trace budget enforced without aborting recovery'
+rmmod pci_pf_bar_recover || fail unload
+bar_ok 0000:08:00.0 || fail 'default all did not continue to outside PF'
+if bar_ok 0000:07:00.0; then fail 'blocked PF unexpectedly allocated'; fi
+echo 'GENERIC-TEST default all continues past failed PF to another root port'
+insmod /modules/pci_pf_bar_recover.ko execute=1 ports=0000:00:03.1,0000:00:04.0 || fail list
+rmmod pci_pf_bar_recover || fail unload
+cmp /protected-before /sys/bus/pci/devices/0000:01:00.0/resource || fail 'active PF resources changed'
+[ -L /sys/bus/pci/devices/0000:01:00.0/driver ] || fail 'active PF driver changed'
+echo 'GENERIC-TEST port list accepted and active PF resources preserved'
+# Restored resource descriptors must suffice for an ordinary PF driver probe.
+echo 0000:04:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebind-near
+echo 0000:08:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebind-outside
+echo 'GENERIC-TEST restored PFs bind to their driver'
+# A live driver under the selected root must reject a rebalance without changes.
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*) cat "$d/resource";; esac
+done > /busy-before
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 ports=0000:00:03.1 || fail busy-load
+rmmod pci_pf_bar_recover || fail busy-unload
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*) cat "$d/resource";; esac
+done > /busy-after
+cmp /busy-before /busy-after || fail 'busy subtree was modified'
+echo 'REBALANCE-TEST active subtree rejected unchanged'
+echo 0000:04:00.0 > /sys/bus/pci/drivers/igb/unbind || fail idle-unbind
+# With drivers absent but an external claim still present, refusal is also mandatory.
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) cat "$d/resource";; esac
+done > /claim-before
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 ports=0000:00:03.1 || fail external-claim
+rmmod pci_pf_bar_recover || fail external-claim-unload
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) cat "$d/resource";; esac
+done > /claim-after
+cmp /claim-before /claim-after || fail 'external-claim subtree was changed'
+echo 'REBALANCE-TEST external resource claim rejected unchanged'
+rmmod fault_fixture || fail remove-blocker
+insmod /modules/rebalance_fixture.ko || fail shrink
+insmod /modules/pci_pf_bar_recover.ko execute=1 conservative_only=1 ports=0000:00:03.1 || fail basic-shrunk
+rmmod pci_pf_bar_recover || fail basic-unload
+if awk 'NR==3 {exit ($3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource; then fail 'conservative mode unexpectedly resized existing window'; fi
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 debug=1 debug_limit=2048 ports=0000:00:03.1 || fail idle-rebalance
+rmmod pci_pf_bar_recover || fail idle-unload
+awk 'NR==3 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource || fail 'wide BAR not restored after rebalance'
+bar_ok 0000:07:00.0 || fail 'previously blocked PF not recovered'
+echo 'REBALANCE-TEST existing 32 MiB bridge chain expanded for 64 MiB BAR'
+rmmod rebalance_fixture || fail shrink-unload
+insmod /modules/rebalance_fixture.ko block_space=1 || fail exhaust
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) cat "$d/resource";; esac
+done > /rollback-before
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) dd if="$d/config" bs=1 count=64 2>/dev/null;; esac
+done > /config-before
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 debug=1 debug_limit=2048 ports=0000:00:03.1 || fail rollback-load
+rmmod pci_pf_bar_recover || fail rollback-unload
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) cat "$d/resource";; esac
+done > /rollback-after
+cmp /rollback-before /rollback-after || fail 'failed allocation did not restore original descriptors'
+for d in /sys/bus/pci/devices/*; do
+ case "$(readlink -f "$d")" in */0000:00:03.1/*|*/0000:00:03.1) dd if="$d/config" bs=1 count=64 2>/dev/null;; esac
+done > /config-after
+cmp /config-before /config-after || fail 'failed allocation did not restore original address registers/commands'
+dmesg | grep -q 'stage=rebalance-failed failed_stage=allocate' || fail 'failed allocation stage trace missing'
+dmesg | grep -q 'stage=rebalance-rollback rc=0' || fail 'successful rollback trace missing'
+echo 'DEBUG-TEST failed stage and rollback result logged'
+echo 'REBALANCE-TEST insufficient address space rolled back original subtree'
+rmmod rebalance_fixture || fail exhaust-unload
+# One successful transaction after rollback demonstrates the tree remains usable.
+insmod /modules/pci_pf_bar_recover.ko execute=1 rebalance=1 ports=0000:00:03.1 || fail post-rollback
+rmmod pci_pf_bar_recover || fail post-rollback-unload
+echo 0000:04:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebound-near
+echo 0000:07:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebound-deep
+cmp /protected-before /sys/bus/pci/devices/0000:01:00.0/resource || fail protected-after-rebalance
+echo 'REBALANCE-TEST rebound PFs after successful retry; other root unchanged'
+echo 2 > /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs || fail 'outside SR-IOV enable'
+[ "$(cat /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs)" = 2 ] || fail 'outside VF count'
+echo 'REBALANCE-TEST other root can still enable two VFs'
+echo 'GENERIC-TEST PASS'
+poweroff -f

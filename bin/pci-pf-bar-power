@@ -1,0 +1,235 @@
+#!/usr/bin/python3
+"""Temporary runtime-PM policy hold around PF BAR repair, with recovery journal."""
+import argparse
+import copy
+from contextlib import contextmanager
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+PCI=Path('/sys/bus/pci/devices')
+RUNTIME=Path('/run/pci-pf-bar-recover')
+STATE=RUNTIME/'power-state.json'
+LOCK=RUNTIME/'power.lock'
+
+class PowerStateError(RuntimeError):pass
+class PowerRestoreError(RuntimeError):pass
+
+def recovery_app():
+    path=Path(__file__).resolve().with_name('pci-pf-bar-recover')
+    loader=importlib.machinery.SourceFileLoader('pfbar_recovery',str(path))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    app=importlib.util.module_from_spec(spec);loader.exec_module(app)
+    return app
+
+def read(path,default=None):
+    try:return path.read_text().strip()
+    except FileNotFoundError:return default
+
+def snapshot(node):
+    return {'bdf':node.name,'path':str(node.resolve()),'inode':node.stat().st_ino,
+            'vendor':read(node/'vendor'),'device':read(node/'device'),'class':read(node/'class'),
+            'control':read(node/'power/control'),'runtime_status':read(node/'power/runtime_status'),
+            'power_state':read(node/'power_state')}
+
+def is_bridge(node):
+    value=read(node/'class')
+    return value is not None and int(value,16)>>8==0x0604
+
+def plan(ports,devices=None):
+    """Choose only requested roots and actual ancestors of unused scoped PFs."""
+    roots=[(PCI/b).resolve()for b in ports]
+    selected={}
+    targets=[]
+    if devices is not None:
+        for bdf in devices:
+            node=PCI/bdf
+            # BDFs originate from the kernel, but still validate before using paths.
+            if not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]',bdf) or not node.exists():raise RuntimeError('Unavailable device disappeared: '+bdf)
+            path=node.resolve()
+            if roots and not any(r in path.parents for r in roots):raise RuntimeError('Device outside requested scope: '+bdf)
+            targets.append(node)
+    else:
+        for node in PCI.iterdir():
+            path=node.resolve()
+            if roots and not any(r in path.parents for r in roots):continue
+            if not any(is_bridge(parent)for parent in path.parents):continue
+            if not is_bridge(node) and not (node/'driver').exists() and not (node/'physfn').exists() and int(read(node/'sriov_numvfs','0'))==0:targets.append(node)
+        for root in roots:selected[str(root)]=root
+    for node in targets:
+        if (node/'driver').exists() or (node/'physfn').exists() or int(read(node/'sriov_numvfs','0')):
+            raise RuntimeError('Power retry candidate is now driver-bound or VF-active: '+node.name)
+        path=node.resolve();selected[str(path)]=path
+        for parent in path.parents:
+            if is_bridge(parent):selected[str(parent)]=parent
+            else:break
+    entries=[]
+    for node in sorted(selected.values(),key=lambda p:(len(p.parts),str(p))):
+        # Do not include a PCI ancestor above an explicitly requested root.
+        if roots and not any(node==r or r in node.parents for r in roots):continue
+        item=snapshot(node)
+        item.update(attempted=False,restored=False);entries.append(item)
+    return entries
+
+def sleeping(entries):
+    return any(e['runtime_status']in ('suspended','suspending') or e['power_state']in ('D3hot','D3cold')for e in entries)
+
+def atomic_json(path,value,mode=0o600):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix='.'+path.name+'-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w')as f:json.dump(value,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.chmod(tmp,mode);os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+@contextmanager
+def locked():
+    if os.geteuid()!=0:raise RuntimeError('Run power repair/restore with sudo')
+    RUNTIME.mkdir(mode=0o700,parents=True,exist_ok=True)
+    with LOCK.open('a+')as lock:
+        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise PowerStateError('A power repair or its child is still running')
+        yield lock
+
+def verify(item):
+    node=PCI/item['bdf'];now=snapshot(node)
+    if any(now[k]!=item[k]for k in ('path','inode','vendor','device','class')):
+        raise RuntimeError('PCI device identity changed: '+item['bdf'])
+    return node,now
+
+def restore_entries(state,emit):
+    errors=[]
+    for item in reversed(state['entries']):
+        if item['restored']:continue
+        try:
+            if item['attempted']:
+                node,now=verify(item)
+                if now['control']!=item['control']:
+                    if now['control']!='on':raise RuntimeError('Unexpected power policy: '+item['bdf'])
+                    (node/'power/control').write_text(item['control']+'\n')
+                if read(node/'power/control')!=item['control']:raise RuntimeError('Power restore did not stick: '+item['bdf'])
+            item['restored']=True
+            emit('power-restored',bdf=item['bdf'],control=item['control'],changed=item['attempted'])
+        except Exception as error:
+            errors.append(item['bdf']+': '+str(error));emit('power-restore-error',bdf=item['bdf'],error=str(error))
+        try:atomic_json(STATE,state)
+        except OSError as error:errors.append('journal: '+str(error))
+    return errors
+
+def run_recovery(ports,debug=False,debug_limit=2048,rebalance=False,module_path=None,devices=None,automatic=False,log=None,conservative_only=False,ensure_id=None,report_path=None):
+    if not 1<=debug_limit<=16384:raise RuntimeError('debug-limit must be 1..16384')
+    if log is not None and Path(log).exists():raise RuntimeError('Log already exists: '+str(log))
+    report={'events':[],'ports':ports,'automatic':automatic}
+    def emit(stage,**values):
+        event=dict(stage=stage,time_ns=time.time_ns(),**copy.deepcopy(values));report['events'].append(event)
+        try:print('pci-pf-bar-power: '+json.dumps(event),flush=True)
+        except OSError:pass
+    with locked()as lock:
+        if STATE.exists():raise PowerStateError('Unfinished power journal exists; inspect and run pci-pf-bar-power restore')
+        try:
+            power_ports=ports
+            if ensure_id:
+                app=recovery_app();ensure_id=app.normalize_id(ensure_id)
+                vendor,device=ensure_id.split(':');power_ports=[]
+                for node in PCI.iterdir():
+                    if read(node/'vendor')!='0x'+vendor or read(node/'device')!='0x'+device or (node/'physfn').exists():continue
+                    parents=[p for p in node.resolve().parents if is_bridge(p)]
+                    if parents and parents[-1].name not in power_ports:power_ports.append(parents[-1].name)
+                if not power_ports and automatic:return None
+            entries=plan(power_ports,devices)
+        except (RuntimeError,OSError)as error:
+            if not automatic:raise
+            emit('automatic-power-plan-failed',error=str(error),action='continue guarded PCI scan')
+            return None
+        emit('power-before',devices=entries)
+        has_candidate=devices is not None or any(int(e['class'],16)>>8!=0x0604 for e in entries)
+        needs_hold=sleeping(entries)or any(e['control']=='auto'for e in entries)
+        if automatic and (not has_candidate or not needs_hold):
+            emit('automatic-retry-skipped',reason='No eligible path needing a temporary runtime-PM hold')
+            return None
+        unsupported=[e for e in entries if e['control']not in ('on','auto')]
+        if sleeping(unsupported):raise RuntimeError('Suspended path has no usable runtime PM control')
+        entries=[e for e in entries if e['control']in ('on','auto')]
+        if not entries:raise RuntimeError('No eligible PCI power paths found')
+        state={'schema':1,'boot_id':read(Path('/proc/sys/kernel/random/boot_id')),'entries':entries}
+        atomic_json(STATE,state) # Before the first policy write, including failed writes.
+        pending=[]
+        old_handlers={sig:signal.signal(sig,lambda signum,frame:pending.append(signum))for sig in (signal.SIGINT,signal.SIGTERM)}
+        child_rc=1;failure=None;errors=[]
+        try:
+            for item in entries:
+                node,now=verify(item)
+                if now['control']!=item['control']:raise RuntimeError('Power policy changed concurrently: '+item['bdf'])
+                if item['control']!='on':
+                    item['attempted']=True;atomic_json(STATE,state)
+                    (node/'power/control').write_text('on\n')
+                emit('power-held',bdf=item['bdf'],control=read(node/'power/control'),runtime_status=read(node/'power/runtime_status'),power_state=read(node/'power_state'))
+                if pending:raise RuntimeError('Interrupted during power preparation')
+            cmd=[str(Path(__file__).resolve().with_name('pci-pf-bar-recover')),'recover','--no-power-retry']
+            if ports:cmd+=['--ports',*ports]
+            if ensure_id:cmd+=['--ensure-id',ensure_id]
+            if debug:cmd+=['--debug','--debug-limit',str(debug_limit)]
+            if rebalance:cmd+=['--rebalance']
+            if conservative_only:cmd+=['--conservative-only']
+            if module_path:cmd+=['--module',str(module_path)]
+            if report_path is not None:cmd+=['--report',str(report_path)]
+            # Defer termination until repair completes. Inherit the lock so a
+            # parent SIGKILL cannot allow restore while the child is still alive.
+            child=subprocess.Popen(cmd,start_new_session=True,pass_fds=(lock.fileno(),))
+            state['child_pid']=child.pid;atomic_json(STATE,state)
+            child_rc=child.wait();emit('repair-exit',returncode=child_rc)
+        except BaseException as error:
+            failure=error;emit('power-run-error',error=str(error))
+        finally:
+            # Wait even if journaling failed immediately after Popen.
+            if 'child'in locals() and child.poll()is None:child_rc=child.wait()
+            errors=restore_entries(state,emit)
+            for sig,handler in old_handlers.items():signal.signal(sig,handler)
+            if not errors:STATE.unlink(missing_ok=True)
+            report.update(child_returncode=child_rc,restore_errors=errors,signals=pending,error=str(failure)if failure else None)
+            if log is not None:atomic_json(Path(log),report,0o644)
+        if errors:raise PowerRestoreError('Power restore incomplete; journal retained at '+str(STATE)+': '+'; '.join(errors))
+        if pending:return 128+pending[0]
+        if failure:
+            if automatic and 'child'not in locals():
+                emit('automatic-power-preparation-failed',error=str(failure),action='original policies restored; continue guarded PCI scan')
+                return None
+            raise RuntimeError(str(failure))
+        return child_rc if child_rc>=0 else 128-child_rc
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action',required=True)
+    status=sub.add_parser('status');status.add_argument('--ports',nargs='+',required=True)
+    recover=sub.add_parser('recover');recover.add_argument('--ports',nargs='+',required=True)
+    recover.add_argument('--debug',action='store_true');recover.add_argument('--debug-limit',type=int,default=2048)
+    recover.add_argument('--conservative-only',action='store_true')
+    recover.add_argument('--rebalance',action='store_true');recover.add_argument('--log',type=Path)
+    sub.add_parser('restore');a=p.parse_args()
+    if a.action=='restore':
+        with locked():
+            if not STATE.exists():print('No unfinished power journal.');return 0
+            state=json.loads(STATE.read_text())
+            if state.get('schema')!=1 or state['boot_id']!=read(Path('/proc/sys/kernel/random/boot_id')):raise RuntimeError('Power journal does not match this boot')
+            errors=restore_entries(state,lambda stage,**v:print(stage,json.dumps(v),flush=True))
+            if errors:raise RuntimeError('; '.join(errors))
+            STATE.unlink();print('Saved power policies restored.');return 0
+    app=recovery_app();ports=app.normalize_ports(a.ports)
+    if a.action=='status':
+        try:pending=STATE.exists()
+        except PermissionError:pending=None
+        print(json.dumps({'devices':plan(ports),'unfinished_journal':pending,'journal':str(STATE)},indent=2));return 0
+    return run_recovery(ports,a.debug,a.debug_limit,a.rebalance,log=a.log,conservative_only=a.conservative_only)
+
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (RuntimeError,OSError,ValueError,subprocess.CalledProcessError)as error:print('ERROR:',error,file=sys.stderr);sys.exit(1)

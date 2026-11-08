@@ -1,0 +1,35 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "EARLY-TEST FAIL: $*"; poweroff -f; exit 1; }
+mode=enabled
+case " $(cat /proc/cmdline) " in *' pfbar_early_test=disabled '*) mode=disabled;; esac
+case " $(cat /proc/cmdline) " in *' pci_pf_bar_rebalance=off '*) mode=bypass;; esac
+# No functional PCI driver is loaded here; only the QEMU-only test fixture.
+insmod /modules/rebalance_fixture.ko || fail fixture
+if [ "$mode" != disabled ]; then
+ mkdir -p /conf
+ echo 0000:00:03.1 > /conf/pci-pf-bar-rebalance
+fi
+cat /sys/bus/pci/devices/0000:08:00.0/resource > /outside-before
+/scripts/init-top/udev || fail wrapper
+[ -f /udev-driver-loaded ] || fail 'original udev action was not reached'
+if [ "$mode" = enabled ]; then
+ [ -L /sys/bus/pci/devices/0000:04:00.0/driver ] || fail 'PF driver did not bind after early stage'
+ [ -L /sys/bus/pci/devices/0000:07:00.0/driver ] || fail 'deep PF driver did not bind after early stage'
+ awk 'NR==3 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource || fail 'early hook did not restore wide BAR'
+ echo 'EARLY-TEST enabled hook rebalanced before functional drivers loaded'
+else
+ if awk 'NR==3 {exit ($3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource; then fail 'disabled/bypassed hook changed BAR'; fi
+ echo "EARLY-TEST $mode left resources unchanged and proceeded to driver loading"
+fi
+# Address descriptors on the other root must remain the same (driver may add claims).
+cmp /outside-before /sys/bus/pci/devices/0000:08:00.0/resource || fail 'outside root descriptors changed'
+echo 2 > /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs || fail 'outside SR-IOV enable'
+[ "$(cat /sys/bus/pci/devices/0000:01:00.0/sriov_numvfs)" = 2 ] || fail 'outside VF count'
+echo 'EARLY-TEST outside root SR-IOV preserved'
+echo 'GENERIC-TEST PASS'
+poweroff -f

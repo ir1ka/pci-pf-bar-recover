@@ -1,0 +1,186 @@
+#!/usr/bin/python3
+"""Explicit, best-effort online recovery of missing physical PCI BARs."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+
+PCI=Path('/sys/bus/pci/devices')
+MODULE='pci_pf_bar_recover'
+
+def command(name):
+    value=shutil.which(name)
+    if not value:
+        for prefix in ('/usr/sbin','/sbin','/usr/bin'):
+            if (Path(prefix)/name).exists():
+                return str(Path(prefix)/name)
+        raise RuntimeError(f'Command missing: {name}')
+    return value
+
+def normalize_ports(values):
+    result=[]
+    for value in values:
+        for bdf in value.split(','):
+            if not re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-1][0-9a-fA-F]\.[0-7]',bdf):
+                raise RuntimeError(f'Invalid full root port BDF: {bdf}')
+            bdf=bdf.lower()
+            p=PCI/bdf
+            if not p.exists() or int((p/'class').read_text(),16)>>8 != 0x0604:
+                raise RuntimeError(f'PCI bridge not found: {bdf}')
+            if bdf not in result:
+                result.append(bdf)
+    return result
+
+def normalize_id(value):
+    if not re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{4}',value):raise RuntimeError('Expected vendor/device ID vvvv:dddd')
+    return value.lower()
+
+def status(ports):
+    result=[]
+    for p in sorted(PCI.iterdir()):
+        ancestors=p.resolve().parts[:-1]
+        if ports and p.name not in ports and not any(port in ancestors for port in ports):
+            continue
+        if (p/'physfn').exists():
+            continue
+        if not (p/'resource').exists():
+            continue
+        rows=[[int(v,16) for v in row.split()] for row in (p/'resource').read_text().splitlines()]
+        assigned=[{'bar':i,'start':hex(a),'size':b-a+1,'unassigned':bool(f&0x20000000) or not a} for i,(a,b,f) in enumerate(rows[:6]) if f&0x300]
+        result.append({'bdf':p.name,'driver':(p/'driver').resolve().name if (p/'driver').exists() else None,'enabled_vfs':int((p/'sriov_numvfs').read_text()) if (p/'sriov_numvfs').exists() else 0,'physical_resources':assigned,'bridge_windows':[{'index':i+13,'start':hex(a),'size':b-a+1,'flags':hex(f),'unassigned':bool(f&0x20000000)or not a}for i,(a,b,f)in enumerate(rows[13:16])if f&0x300]})
+    return {'schema':1,'project':'pci-pf-bar-recover','kernel':platform.release(),'ports':ports or 'all','devices':result,'note':'Read-only status cannot distinguish an unused BAR from a descriptor erased by an allocation failure; the recovery module probes eligible unused devices.'}
+
+def read_result():
+    parameters=Path('/sys/module')/MODULE/'parameters'
+    result={name:int((parameters/name).read_text().strip()) for name in ('restored','failed','skipped')}
+    missing=parameters/'unavailable_devices'
+    if missing.exists():result['unavailable_devices']=[b for b in missing.read_text().strip().split(',')if b]
+    for name in ('ensure_matched','ensure_complete','cmp_reserved','cmp_prepared'):
+        path=parameters/name
+        if path.exists():result[name]=int(path.read_text())
+    records=parameters/'result_records'
+    if records.exists():
+        result['records']=[json.loads(line)for line in records.read_text().splitlines()if line.strip()]
+        result['records_dropped']=int((parameters/'result_dropped').read_text())
+    return result
+
+def save_report(path,value):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'w')as f:
+        json.dump(value,f,indent=2);f.write('\n');f.flush();os.fsync(f.fileno())
+
+def power_app():
+    path=Path(__file__).resolve().with_name('pci-pf-bar-power')
+    loader=importlib.machinery.SourceFileLoader('pfbar_power',str(path))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    app=importlib.util.module_from_spec(spec);loader.exec_module(app)
+    return app
+
+def recover(ports, module_path=None, rebalance=False, debug=False, debug_limit=2048, power_retry=True, power_log=None, conservative_only=False, ensure_id=None, report_path=None):
+    if report_path is not None and report_path.exists():raise RuntimeError('Report already exists: '+str(report_path))
+    if ensure_id is not None:
+        ensure_id=normalize_id(ensure_id)
+        if ports or rebalance or conservative_only:raise RuntimeError('--ensure-id cannot combine with --ports, --rebalance or --conservative-only')
+    if debug_limit<1 or debug_limit>16384:raise RuntimeError('debug-limit must be 1..16384')
+    if power_retry and power_log is not None and power_log.exists():raise RuntimeError('Power log already exists: '+str(power_log))
+    if rebalance and conservative_only:raise RuntimeError('--rebalance conflicts with --conservative-only')
+    if rebalance and not ports:
+        raise RuntimeError('Experimental rebalance requires explicit --ports')
+    if os.geteuid()!=0:
+        raise RuntimeError('Run recover using sudo; status is read-only')
+    module=str(module_path) if module_path else subprocess.check_output([command('modinfo'),'-n',MODULE],text=True).strip()
+    vermagic=subprocess.check_output([command('modinfo'),'-F','vermagic',module],text=True).split()[0]
+    if vermagic!=platform.release():
+        raise RuntimeError('Module kernel ABI does not match running kernel')
+    parameters=subprocess.check_output([command('modinfo'),'-p',module],text=True)
+    if not all(any(line.startswith(name+':') for line in parameters.splitlines()) for name in (('execute','ports','rebalance') if rebalance else ('execute','ports','restored','failed','skipped','conservative_only'))):
+        raise RuntimeError('Module does not provide the required execution and port parameters')
+    if not conservative_only and not any(line.startswith('cmp_reserve:')for line in parameters.splitlines()):raise RuntimeError('Module lacks window-only reservation support; refusing an older module')
+    if ensure_id and not all(any(line.startswith(name+':')for line in parameters.splitlines())for name in ('ensure_id','ensure_matched','ensure_complete')):raise RuntimeError('Module lacks ensure-id support')
+    if debug and not all(any(line.startswith(name+':')for line in parameters.splitlines())for name in ('debug','debug_limit')):raise RuntimeError('Module lacks debug parameters')
+    active=Path('/sys/module')/MODULE
+    if active.exists():
+        gate=active/'parameters/execute'
+        if gate.exists() and gate.read_text().strip()=='N':
+            subprocess.run([command('rmmod'),MODULE],check=True)
+        else:
+            raise RuntimeError('An executing recovery module is already loaded; inspect its state first')
+    args=['execute=1','ensure_id='+ensure_id] if ensure_id else ['execute=1','ports='+','.join(ports)]
+    if rebalance:args.append('rebalance=1')
+    if conservative_only:args.append('conservative_only=1')
+    if debug:
+        args.extend(['debug=1','debug_limit='+str(debug_limit)])
+        print(f'Debug trace enabled: limit={debug_limit}; collect pf-bar-recover/pci_pf_bar_recover kernel messages.',flush=True)
+    if power_retry:
+        code=power_app().run_recovery(ports,debug,debug_limit,rebalance,module_path,automatic=True,log=power_log,conservative_only=conservative_only,ensure_id=ensure_id,**({'report_path':report_path}if report_path is not None else{}))
+        if code is not None:return code
+    before=status(ports) if report_path is not None else None
+    loaded=False
+    try:
+        subprocess.run(([command('insmod'),module] if module_path else [command('modprobe'),MODULE])+args,check=True)
+        loaded=True
+        result=read_result()
+        if report_path is not None:
+            save_report(report_path,{'schema':1,'project':'pci-pf-bar-recover','kernel':platform.release(),
+                'before':before,'result':result,'after':status(ports),
+                'note':'Reservation goals are not physical BAR sizes or NVIDIA probe success.'})
+    finally:
+        if loaded:
+            subprocess.run([command('rmmod'),MODULE],check=True)
+    if rebalance:
+        print('Experimental scan ended; inspect dmesg for commit/skip/rollback. Completion alone does not confirm recovery. No reboot or boot policy changes.')
+        return 0
+    print('Recovery result: '+', '.join(f'{name}={result[name]}' for name in ('restored','failed','skipped')),flush=True)
+    if result.get('unavailable_devices'):
+        print('Unavailable devices: '+','.join(result['unavailable_devices'])+'; presence checks remain enforced.',flush=True)
+    if ensure_id:
+        complete=bool(result.get('ensure_complete')) and result.get('ensure_matched',0)>0
+        print(f"Ensure {ensure_id}: matched={result.get('ensure_matched',0)}, complete={complete}",flush=True)
+        return 0 if complete else (3 if result['restored'] else 2)
+    reserved=result.get('cmp_reserved',result.get('cmp_prepared',0))
+    if 'cmp_reserved' in result or 'cmp_prepared' in result:
+        print(f"CMP window plans committed: {reserved}; device unlock/expansion belongs to NVIDIA.",flush=True)
+    if not result['restored'] and not reserved:
+        print('No device recovery confirmed. Devices may have been skipped or already healthy; inspect per-device kernel logs. No reboot or boot policy changes.')
+        return 2
+    if result['failed']:
+        print('Partial recovery; other device failures were skipped. Inspect per-device kernel logs.')
+        return 3
+    print('PF recovery/window reservation committed on the reported devices. Skipped devices were not repaired. No reboot or boot policy changes.')
+    return 0
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action',choices=('status','recover'))
+    parser.add_argument('--ports',nargs='+',default=[],metavar='ROOT_PORT',help='Root port BDF list (spaces or commas); default all PCI devices')
+    parser.add_argument('--ensure-id',metavar='VENDOR:DEVICE',help='Ensure all matching PFs across their root ports; allow joint rebalance and shrinking assigned target ReBARs')
+    parser.add_argument('--rebalance',action='store_true',help='EXPERIMENTAL: atomically rebalance an idle subtree; requires --ports')
+    parser.add_argument('--conservative-only',action='store_true',help='Disable automatic idle-subtree rebalance and ReBAR shrinking after failed allocations')
+    parser.add_argument('--module',type=Path,help='Use an explicitly built exact-ABI module instead of the DKMS-installed module')
+    parser.add_argument('--debug',action='store_true',help='Enable bounded detailed kernel tracing for this execution only')
+    parser.add_argument('--debug-limit',type=int,default=2048,help='Maximum detail records, 1..16384 (default 2048)')
+    parser.add_argument('--no-power-retry',action='store_true',help='Disable automatic temporary runtime-PM holds')
+    parser.add_argument('--power-log',type=Path,help='Save automatic power retry report to a new JSON file')
+    parser.add_argument('--report',type=Path,help='Save new private JSON report before module unload; includes actual BARs, window goals and transaction failures')
+    args=parser.parse_args()
+    ports=normalize_ports(args.ports)
+    if args.action=='status':
+        if args.ensure_id:raise RuntimeError('--ensure-id is a recovery option; status does not probe missing BARs')
+        print(json.dumps(status(ports),ensure_ascii=False,indent=2))
+    else:
+        return recover(ports,args.module,args.rebalance,args.debug,args.debug_limit,not args.no_power_retry,args.power_log,args.conservative_only,args.ensure_id,args.report)
+    return 0
+
+if __name__=='__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError,OSError,subprocess.CalledProcessError) as exc:
+        print(f'ERROR: {exc}',file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,67 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "WINDOW-TEST FAIL: $*"; dmesg; poweroff -f; exit 1; }
+mode=full
+for arg in $(cat /proc/cmdline); do case "$arg" in window_test=*) mode=${arg#*=};; esac; done
+opts=
+[ "$mode" != limited ] || opts=limited=1
+[ "$mode" != preserve ] || opts=preserve=1
+[ "$mode" != mixed ] || opts=mixed=1
+[ "$mode" != floor ] || opts="limited=1 floor_budget=1"
+insmod /modules/window_fixture.ko $opts || fail fixture
+root=$(cat /sys/module/window_fixture/parameters/root_bdf)
+ep0=$(cat /sys/module/window_fixture/parameters/ep0)
+ep1=$(cat /sys/module/window_fixture/parameters/ep1)
+insmod /modules/pci_pf_bar_recover.ko execute=1 ports="$root" debug=1 debug_limit=512 || fail recovery
+if [ "$mode" = preserve ];then
+ [ "$(cat /sys/module/pci_pf_bar_recover/parameters/cmp_reserved)" = 0 ] || fail firmware-overridden
+ [ "$(cat /sys/module/window_fixture/parameters/control_writes)" = 0 ] || fail firmware-resize
+ cat /sys/module/pci_pf_bar_recover/parameters/result_records | grep -q '"rc":-1' || fail no-firmware-report
+ dmesg | grep -q 'firmware preserve_config' || fail no-firmware-guard
+ echo 'GENERIC-TEST PASS'
+ poweroff -f;exit 0
+fi
+[ "$(cat /sys/module/pci_pf_bar_recover/parameters/cmp_reserved)" = 2 ] || fail reserved-count
+[ "$(cat /sys/module/window_fixture/parameters/control_writes)" = 0 ] || fail unexpected-physical-resize
+for ep in "$ep0" "$ep1"; do
+ set -- $(sed -n '2p' /sys/bus/pci/devices/"$ep"/resource)
+ [ "$(( $2 - $1 + 1 ))" = 67108864 ] || fail actual-size-not-64M
+ [ "$(( $1 ))" -gt 0 ] || fail unassigned
+ if [ "$mode" != limited ] && [ "$mode" != floor ];then
+  start=$(( $1 ));[ "$(( start % 68719476736 ))" = 0 ] || fail slot-alignment
+  set -- $(sed -n '4p' /sys/bus/pci/devices/"$ep"/resource)
+  [ "$(( $1 ))" -lt "$start" ] || [ "$(( $1 ))" -ge "$(( start + 68719476736 ))" ] || fail bar3-inside-slot
+ fi
+ cat /sys/bus/pci/devices/"$ep"/resource
+ done
+cat /sys/module/pci_pf_bar_recover/parameters/result_records
+rmmod pci_pf_bar_recover || fail unload
+if [ "$mode" = limited ] || [ "$mode" = floor ];then
+ dmesg | grep -q 'goal reduced' || fail no-capacity-fallback
+ echo 0 > /sys/module/window_fixture/parameters/driver_resize || fail first-driver-fallback
+ echo 1 > /sys/module/window_fixture/parameters/driver_resize || fail second-driver-fallback
+ smaller=0
+ for ep in "$ep0" "$ep1";do
+  set -- $(sed -n '2p' /sys/bus/pci/devices/"$ep"/resource)
+  size=$(( $2 - $1 + 1 ));[ "$size" -ge 67108864 ] || fail physical-too-small
+  [ "$size" -le 68719476736 ] || fail physical-too-large
+  [ "$size" = 68719476736 ] || smaller=1
+ done
+ [ "$smaller" = 1 ] || fail no-driver-fallback-observed
+else
+ [ "$(dmesg | grep -c 'BAR1 actual=67108864 goal=68719476736')" = 2 ] || fail goals-not-64G
+ echo 0 > /sys/module/window_fixture/parameters/driver_resize || fail first-driver-resize
+ echo 1 > /sys/module/window_fixture/parameters/driver_resize || fail second-driver-resize
+ for ep in "$ep0" "$ep1"; do
+  set -- $(sed -n '2p' /sys/bus/pci/devices/"$ep"/resource)
+  [ "$(( $2 - $1 + 1 ))" = 68719476736 ] || fail not-64G-after-driver
+ done
+fi
+dmesg | grep -E 'pf-bar reserve:|WINDOW-TEST driver resize' || :
+echo "WINDOW-TEST $mode PASS: small real BARs at PF exit, bridge capacity committed, driver owns expansion"
+echo 'GENERIC-TEST PASS'
+poweroff -f

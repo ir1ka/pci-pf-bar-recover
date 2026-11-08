@@ -1,0 +1,69 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "REBAR-TEST FAIL: $*"; dmesg; poweroff -f; exit 1; }
+mode=success
+for arg in $(cat /proc/cmdline); do case "$arg" in pfbar_rebar_test=*) mode=${arg#*=};; esac; done
+opts='hole_mb=64'
+case "$mode" in multi) opts='hole_mb=32';; exhausted) opts='hole_mb=0';; mismatch) opts='hole_mb=64 mismatch=1';; busy) opts='hole_mb=64 external_claim=1';; writefail) opts='hole_mb=64 write_fail=1';; esac
+insmod /modules/rebar_fixture.ko $opts || fail fixture
+root=/sys/bus/pci/devices/0000:00:06.0
+ep=/sys/bus/pci/devices/0000:0a:00.0
+[ -d "$ep" ] || fail topology
+for d in "$root" "$ep"; do cat "$d/resource"; done > /before-res
+for d in "$root" "$ep"; do dd if="$d/config" bs=1 count=64 2>/dev/null; done > /before-conf
+cat /sys/module/rebar_fixture/parameters/control > /before-rebar
+cat /sys/bus/pci/devices/0000:01:00.0/resource > /outside
+cat /sys/bus/pci/devices/0000:00:05.0/resource > /healthy
+if [ "$mode" = early ]; then
+ mkdir -p /conf
+ echo 0000:00:06.0 > /conf/pci-pf-bar-rebalance
+ /scripts/init-top/udev || fail early-wrapper
+ [ -f /udev-driver-loaded ] || fail original-udev
+ [ ! -d /sys/module/pci_pf_bar_recover ] || fail early-module-unload
+else
+ extra=
+ [ "$mode" != conservative ] || extra=conservative_only=1
+ [ "$mode" != forced ] || extra=rebalance=1
+ ports=ports=0000:00:05.0,0000:00:06.0
+ [ "$mode" != global ] || ports=ports=
+ [ "$mode" != forced ] || ports=ports=0000:00:06.0
+ insmod /modules/pci_pf_bar_recover.ko execute=1 $extra debug=1 debug_limit=2048 $ports || fail recovery
+ if [ "$mode" = success ] || [ "$mode" = multi ]; then
+  [ "$(cat /sys/module/pci_pf_bar_recover/parameters/restored)" = 1 ] || fail restored-counter
+  [ "$(cat /sys/module/pci_pf_bar_recover/parameters/failed)" = 0 ] || fail failed-counter
+ fi
+ rmmod pci_pf_bar_recover || fail unload
+fi
+cmp /outside /sys/bus/pci/devices/0000:01:00.0/resource || fail outside
+cmp /healthy /sys/bus/pci/devices/0000:00:05.0/resource || fail healthy
+if dmesg | grep -q '0000:00:05.0: rebalance:'; then fail 'healthy root rebalanced'; fi
+case "$mode" in
+ success|multi|early|forced|global)
+  expected=33554431
+  [ "$mode" != multi ] || expected=16777215
+  # Read range length using shell arithmetic, and compare the modeled hardware control.
+  line=$(sed -n '3p' "$ep/resource"); set -- $line
+  [ "$(( $2 - $1 ))" = "$expected" ] || fail size
+  dmesg | grep -q 'ReBAR2 reduced' || fail 'no resize'
+  dmesg | grep -q '0000:00:06.0: rebalance: COMMITTED' || fail commit
+  control=$(cat /sys/module/rebar_fixture/parameters/control)
+  size=$(( (control >> 8) & 31 ))
+  if [ "$mode" != multi ]; then [ "$size" = 5 ] || fail control32; fi
+  [ "$mode" != multi ] || [ "$size" = 4 ] || fail control16
+  echo "REBAR-TEST $mode smaller advertised BAR committed and control verified";;
+ *)
+  for d in "$root" "$ep"; do cat "$d/resource"; done > /after-res
+  for d in "$root" "$ep"; do dd if="$d/config" bs=1 count=64 2>/dev/null; done > /after-conf
+  cat /sys/module/rebar_fixture/parameters/control > /after-rebar
+  cmp /before-res /after-res || fail 'resources not restored'
+  cmp /before-conf /after-conf || fail 'config not restored'
+  cmp /before-rebar /after-rebar || fail 'ReBAR control not restored'
+  if dmesg | grep -q 'ROLLBACK FAILED'; then fail quarantine; fi
+  echo "REBAR-TEST $mode original resources, address registers and ReBAR control restored";;
+esac
+echo 'GENERIC-TEST PASS'
+poweroff -f

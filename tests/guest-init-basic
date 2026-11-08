@@ -1,0 +1,50 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "GENERIC-TEST FAIL: $*"; poweroff -f; exit 1; }
+bar_ok() { awk 'NR==1 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' "/sys/bus/pci/devices/$1/resource"; }
+insmod /modules/i2c-algo-bit.ko || fail i2c
+insmod /modules/dca.ko || fail dca
+insmod /modules/igb.ko || fail igb
+for bdf in 0000:04:00.0 0000:07:00.0 0000:08:00.0; do
+ echo "$bdf" > /sys/bus/pci/drivers/igb/unbind || fail unbind
+ # Driver removal can leave VF ranges allocated, which the module must drop.
+done
+[ -L /sys/bus/pci/devices/0000:01:00.0/driver ] || fail 'protected device driver missing'
+cat /sys/bus/pci/devices/0000:01:00.0/resource > /protected-before
+insmod /modules/fault_fixture.ko || fail fixture
+for bdf in 0000:04:00.0 0000:07:00.0 0000:08:00.0; do
+ if bar_ok "$bdf"; then fail 'fixture failed to erase descriptor'; fi
+done
+insmod /modules/pci_pf_bar_recover.ko || fail 'idle load'
+[ "$(cat /sys/module/pci_pf_bar_recover/parameters/execute)" = N ] || fail 'idle execution gate'
+if bar_ok 0000:04:00.0; then fail 'plain module load changed resources'; fi
+rmmod pci_pf_bar_recover || fail 'idle unload'
+echo 'GENERIC-TEST idle load makes no resource changes'
+insmod /modules/pci_pf_bar_recover.ko execute=1 ports=0000:00:03.1 || fail scoped
+rmmod pci_pf_bar_recover || fail unload
+bar_ok 0000:04:00.0 || fail 'eligible scoped PF not recovered'
+if bar_ok 0000:07:00.0; then fail 'blocked PF unexpectedly allocated'; fi
+if bar_ok 0000:08:00.0; then fail 'outside scoped root was changed'; fi
+awk 'NR==3 {exit ($1=="0x0000000000000000" || $3=="0x0000000000000000")}' /sys/bus/pci/devices/0000:04:01.0/resource || fail '64-bit BAR or new bridge window not recovered'
+echo 'GENERIC-TEST 64-bit BAR and previously missing bridge windows recovered'
+echo 'GENERIC-TEST scoped root recovers usable PF, skips exhausted PF, leaves outside untouched'
+insmod /modules/pci_pf_bar_recover.ko execute=1 || fail global
+rmmod pci_pf_bar_recover || fail unload
+bar_ok 0000:08:00.0 || fail 'default all did not continue to outside PF'
+if bar_ok 0000:07:00.0; then fail 'blocked PF unexpectedly allocated'; fi
+echo 'GENERIC-TEST default all continues past failed PF to another root port'
+insmod /modules/pci_pf_bar_recover.ko execute=1 ports=0000:00:03.1,0000:00:04.0 || fail list
+rmmod pci_pf_bar_recover || fail unload
+cmp /protected-before /sys/bus/pci/devices/0000:01:00.0/resource || fail 'active PF resources changed'
+[ -L /sys/bus/pci/devices/0000:01:00.0/driver ] || fail 'active PF driver changed'
+echo 'GENERIC-TEST port list accepted and active PF resources preserved'
+# Restored resource descriptors must suffice for an ordinary PF driver probe.
+echo 0000:04:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebind-near
+echo 0000:08:00.0 > /sys/bus/pci/drivers/igb/bind || fail rebind-outside
+echo 'GENERIC-TEST restored PFs bind to their driver'
+echo 'GENERIC-TEST PASS'
+poweroff -f

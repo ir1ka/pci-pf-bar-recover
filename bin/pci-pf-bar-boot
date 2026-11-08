@@ -1,0 +1,145 @@
+#!/usr/bin/python3
+"""Explicit opt-in/out for initramfs PF BAR recovery."""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+CONFIG=Path('/etc/initramfs-tools/conf.d/pci-pf-bar-rebalance')
+STATE=Path('/var/lib/pci-pf-bar-recover/early-image-state')
+MARKER='# Managed by pci-pf-bar-boot; experimental opt-in\n'
+
+def validate_ports(values):
+    path=Path(__file__).resolve().with_name('pci-pf-bar-recover')
+    loader=importlib.machinery.SourceFileLoader('pci_pf_recover_cli',str(path))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    app=importlib.util.module_from_spec(spec);loader.exec_module(app)
+    return app.normalize_ports(values)
+
+def refresh():
+    tool=shutil.which('update-initramfs')
+    if not tool:
+        raise RuntimeError('initramfs-tools/update-initramfs is required for this optional feature')
+    subprocess.run([tool,'-u','-k','all'],check=True)
+
+def write_path(path):
+    safe_path(path)
+    with subprocess.Popen(['dpkg-query','-S',str(path)],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)as query:
+        output=query.communicate()[0]
+        if query.returncode==1:return
+        if query.returncode!=0:raise RuntimeError('Cannot verify package ownership: '+str(path))
+    owners=set()
+    for line in output.splitlines():
+        head=line.split(': /',1)[0]
+        owners.update(item.strip().split(':',1)[0]for item in head.split(','))
+    if not owners or owners-set(('pci-pf-bar-recover-dkms', 'pci-pf-bar-recover-prebuilt')):
+        raise RuntimeError('Refusing configuration owned by another package: '+str(path))
+
+def remove_file(path):
+    write_path(path);path.unlink(missing_ok=True)
+
+def safe_path(path):
+    if path.is_symlink()or any(p.is_symlink()for p in path.parents):
+        raise RuntimeError('Refusing symlink-managed path: '+str(path))
+    if path.exists()and not path.is_file():raise RuntimeError('Not a regular managed file: '+str(path))
+    if path==STATE and path.exists()and path.read_text().strip()not in ('enabled','enabling','rollback-rebuild-needed','disable-rebuild-needed'):
+        raise RuntimeError('Unmanaged image state; preserved: '+str(path))
+
+def atomic_write(path,content):
+    write_path(path)
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,temp=tempfile.mkstemp(prefix='.pfbar-',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w') as f:
+            f.write(content)
+        os.chmod(temp,0o644)
+        os.replace(temp,path)
+    finally:
+        if os.path.exists(temp):os.unlink(temp)
+
+def write_config(content):
+    atomic_write(CONFIG,content)
+
+def set_state(value):
+    if value is None:remove_file(STATE)
+    else:atomic_write(STATE,value+'\n')
+
+def enable(values,ensure_id=None):
+    write_path(CONFIG);write_path(STATE)
+    if ensure_id is not None:
+        if values or not re.fullmatch(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{4}',ensure_id):
+            raise RuntimeError('Use --ensure-id vvvv:dddd or --ports, not both')
+        ensure_id=ensure_id.lower();ports=[]
+    else:
+        ports=validate_ports(values)
+        if not ports:raise RuntimeError('An explicit root-port list or --ensure-id is required')
+    previous=CONFIG.read_text() if CONFIG.exists() else None
+    if previous is not None and not previous.startswith(MARKER):
+        raise RuntimeError(f'{CONFIG} is not tool-managed; review it manually')
+    if not shutil.which('update-initramfs'):
+        raise RuntimeError('Install initramfs-tools before enabling this option')
+    content=MARKER+"PFBAR_REBALANCE=experimental\nPFBAR_PORTS='"+','.join(ports)+"'\n"
+    if ensure_id is not None:content+="PFBAR_ENSURE_ID='"+ensure_id+"'\n"
+    previous_state=STATE.read_text().strip() if STATE.exists() else None
+    set_state('enabling')
+    write_config(content)
+    try:
+        refresh()
+    except (OSError,RuntimeError,subprocess.CalledProcessError) as exc:
+        if previous is None:remove_file(CONFIG)
+        else:write_config(previous)
+        set_state('rollback-rebuild-needed')
+        try:refresh()
+        except (OSError,RuntimeError,subprocess.CalledProcessError):
+            raise RuntimeError('Image update and rollback rebuild failed; config restored but boot images may be mixed. Review/rebuild initramfs before reboot.') from exc
+        set_state(previous_state)
+        raise RuntimeError('Enable failed; original config and boot images restored') from exc
+    set_state('enabled')
+    print('Early recovery enabled for '+('all matching '+ensure_id+' across their roots' if ensure_id else ','.join(ports))+'. No reboot performed.')
+
+def disable():
+    write_path(CONFIG);write_path(STATE)
+    if not CONFIG.exists() and not STATE.exists():
+        print('Already disabled; no configuration or boot images changed.')
+        return
+    if CONFIG.exists() and not CONFIG.read_text().startswith(MARKER):
+        raise RuntimeError(f'{CONFIG} is not tool-managed; review it manually')
+    set_state('disable-rebuild-needed')
+    remove_file(CONFIG)
+    try:refresh()
+    except (OSError,RuntimeError,subprocess.CalledProcessError) as exc:
+        raise RuntimeError('Config disabled but initramfs update failed; an old image may still contain the enabled hook. Rebuild images before reboot.') from exc
+    set_state(None)
+    print('Early rebalance disabled and initramfs rebuilt. No reboot performed.')
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    sub=parser.add_subparsers(dest='action',required=True)
+    sub.add_parser('status')
+    action=sub.add_parser('enable')
+    # Accept old invocations without requiring or advertising the retired flag.
+    action.add_argument('--experimental',action='store_true',help=argparse.SUPPRESS)
+    scope=action.add_mutually_exclusive_group(required=True)
+    scope.add_argument('--ports',nargs='+',default=[])
+    scope.add_argument('--ensure-id',metavar='VENDOR:DEVICE')
+    sub.add_parser('disable')
+    args=parser.parse_args()
+    if args.action=='status':
+        print(json.dumps({'enabled_config':CONFIG.exists() and 'PFBAR_REBALANCE=experimental' in CONFIG.read_text().splitlines(),'image_state':STATE.read_text().strip() if STATE.exists() else None,'config':str(CONFIG),'content':CONFIG.read_text() if CONFIG.exists() else None,'note':'Config state only; inspect rebuilt initramfs to verify image contents.'},indent=2))
+        return 0
+    if os.geteuid()!=0:raise RuntimeError('Run enable/disable with sudo')
+    if args.action=='enable':enable(args.ports,args.ensure_id)
+    else:disable()
+    return 0
+
+if __name__=='__main__':
+    try:sys.exit(main())
+    except (RuntimeError,OSError,subprocess.CalledProcessError) as exc:
+        print(f'ERROR: {exc}',file=sys.stderr);sys.exit(1)

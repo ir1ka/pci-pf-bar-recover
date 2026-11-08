@@ -1,0 +1,14 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+	PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
+
+override_dh_auto_clean:
+
+override_dh_installdeb:
+	python3 tools/file_guard.py --debian debian --dkms-provider pci-pf-bar-recover-dkms=pci-pf-bar-recover --module-file pci-pf-bar-recover-dkms=pci_pf_bar_recover
+	dh_installdeb

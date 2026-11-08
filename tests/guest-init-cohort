@@ -1,0 +1,63 @@
+#!/bin/sh
+/bin/busybox --install -s /bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+exec </dev/console >/dev/console 2>&1
+fail() { echo "COHORT-TEST FAIL: $*"; dmesg; poweroff -f; exit 1; }
+mode=success
+for arg in $(cat /proc/cmdline); do case "$arg" in pfbar_cohort_test=*) mode=${arg#*=};; esac; done
+for m in i2c-algo-bit dca igb; do insmod /modules/$m.ko || fail driver; done
+echo 2 > /sys/bus/pci/devices/0000:03:00.0/sriov_numvfs || fail outside-vfs
+opts=
+case "$mode" in healthy) opts=healthy=1;; mismatch) opts=mismatch=1;; busy) opts=busy=1;; esac
+insmod /modules/cohort_fixture.ko $opts || fail fixture
+snapshot() {
+ for b in 0000:00:01.0 0000:01:00.0 0000:00:02.0 0000:02:00.0; do
+  cat /sys/bus/pci/devices/$b/resource
+  dd if=/sys/bus/pci/devices/$b/config bs=1 count=64 2>/dev/null
+ done
+ cat /sys/module/cohort_fixture/parameters/controls
+}
+snapshot > /before
+cat /sys/bus/pci/devices/0000:03:00.0/resource > /outside
+id=1b36:0005
+[ "$mode" != nomatch ] || id=abcd:1234
+if [ "$mode" = early ]; then
+ mkdir -p /conf
+ : > /conf/pci-pf-bar-rebalance
+ echo "$id" > /conf/pci-pf-bar-ensure-id
+ # The test's original udev script is a no-op marker; outside driver is already loaded.
+ printf '#!/bin/sh\necho yes > /udev-loaded\n' > /lib/pci-pf-bar-recover/udev.original
+ chmod +x /lib/pci-pf-bar-recover/udev.original
+ /scripts/init-top/udev || fail early-wrapper
+ [ -f /udev-loaded ] || fail early-udev
+else
+ insmod /modules/pci_pf_bar_recover.ko execute=1 debug=1 debug_limit=4096 ensure_id=$id || fail load
+ complete=$(cat /sys/module/pci_pf_bar_recover/parameters/ensure_complete)
+ matched=$(cat /sys/module/pci_pf_bar_recover/parameters/ensure_matched)
+ case "$mode" in success|healthy) [ "$complete" = 1 ] && [ "$matched" = 2 ] || fail completeness;;
+  *) [ "$complete" = 0 ] || fail unexpected-complete;; esac
+ rmmod pci_pf_bar_recover || fail unload
+fi
+cmp /outside /sys/bus/pci/devices/0000:03:00.0/resource || fail outside-changed
+[ "$(cat /sys/bus/pci/devices/0000:03:00.0/sriov_numvfs)" = 2 ] || fail outside-vfs-changed
+case "$mode" in
+ success|early)
+  dmesg | grep -q 'ensure-id jointly rebalancing 2 roots' || fail joint-path
+  for b in 0000:01:00.0 0000:02:00.0; do
+   line=$(sed -n '3p' /sys/bus/pci/devices/$b/resource); set -- $line
+   [ "$(( $2 - $1 + 1 ))" = 33554432 ] || fail reduced-size
+  done
+  controls=$(cat /sys/module/cohort_fixture/parameters/controls); set -- $controls
+  [ "$(( ($1 >> 8) & 31 ))" = 5 ] && [ "$(( ($2 >> 8) & 31 ))" = 5 ] || fail controls
+  echo 'COHORT-TEST assigned donor and failed recipient on two roots now both have 32 MiB BARs';;
+ *) snapshot > /after; cmp /before /after || fail original-state
+  if [ "$mode" = healthy ]; then
+   if dmesg | grep -q 'ensure-id jointly rebalancing'; then fail unnecessary-rebalance; fi
+  fi
+  echo "COHORT-TEST $mode preserved both root states";;
+esac
+echo 'COHORT-TEST unrelated active root SR-IOV preserved'
+echo 'GENERIC-TEST PASS'
+poweroff -f

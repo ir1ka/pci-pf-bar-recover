@@ -1,0 +1,6 @@
+#!/bin/sh
+case ${1:-} in prereqs) exit 0;; esac
+insmod /modules/i2c-algo-bit.ko || exit 1
+insmod /modules/dca.ko || exit 1
+insmod /modules/igb.ko || exit 1
+echo loaded > /udev-driver-loaded

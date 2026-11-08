@@ -1,0 +1,10 @@
+src/*.o
+src/*.ko
+src/*.mod
+src/*.mod.c
+src/Module.symvers
+src/modules.order
+src/.*.cmd
+bin/__pycache__/
+tests/__pycache__/
+src/.*.o

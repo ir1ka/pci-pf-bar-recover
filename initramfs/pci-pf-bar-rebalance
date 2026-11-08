@@ -1,0 +1,57 @@
+#!/bin/sh
+# Dormant unless explicitly enabled by pci-pf-bar-boot.
+set -eu
+case ${1:-} in prereqs) exit 0;; esac
+cfg="${CONFDIR:-/etc/initramfs-tools}/conf.d/pci-pf-bar-rebalance"
+[ -f "$cfg" ] || exit 0
+. "$cfg"
+[ "${PFBAR_REBALANCE:-disabled}" = experimental ] || exit 0
+# A source-free prebuilt package only supports the ABI listed in this file.
+# DKMS installations have no such file and retain per-kernel validation below.
+prebuilt=/usr/share/pci-pf-bar-recover/prebuilt-kernels
+if [ -f "$prebuilt" ] && ! grep -Fxq "$version" "$prebuilt"; then
+    exit 0
+fi
+ports=${PFBAR_PORTS:-}
+ensure_id=${PFBAR_ENSURE_ID:-}
+if [ -n "$ensure_id" ]; then
+    [ -z "$ports" ] && printf '%s\n' "$ensure_id" | grep -Eq '^[[:xdigit:]]{4}:[[:xdigit:]]{4}$' || {
+        echo 'E: ensure-id must be vvvv:dddd and cannot combine with ports' >&2; exit 1;
+    }
+    modinfo -k "$version" -p pci_pf_bar_recover | grep -q '^ensure_id:' || {
+        echo 'E: installed module lacks ensure-id support' >&2; exit 1;
+    }
+else
+    printf '%s\n' "$ports" | grep -Eq '^[[:xdigit:]]{4}:[[:xdigit:]]{2}:[01][[:xdigit:]]\.[0-7](,[[:xdigit:]]{4}:[[:xdigit:]]{2}:[01][[:xdigit:]]\.[0-7])*$' || {
+        echo 'E: pci-pf-bar-rebalance requires valid ports or ensure-id' >&2; exit 1;
+    }
+fi
+[ -s "$DESTDIR/scripts/init-top/udev" ] || {
+    echo 'E: unsupported initramfs layout: init-top/udev is absent' >&2
+    exit 1
+}
+. /usr/share/initramfs-tools/hook-functions
+. /usr/share/pci-pf-bar-recover/initramfs-runtime
+# Do not let a missing per-kernel DKMS binary silently produce a no-op image.
+[ "$(modinfo -k "$version" -F name pci_pf_bar_recover)" = pci_pf_bar_recover ]
+modinfo -k "$version" -p pci_pf_bar_recover | grep -q '^conservative_only:' || {
+    echo 'E: installed DKMS module lacks automatic recovery controls' >&2
+    exit 1
+}
+modinfo -k "$version" -p pci_pf_bar_recover | grep -q '^cmp_reserve:' || {
+    echo 'E: installed module lacks window-only reservation support; refusing older implementation' >&2
+    exit 1
+}
+# The module is staged uncompressed by initramfs-runtime.
+mkdir -p "$DESTDIR/lib/pci-pf-bar-recover" "$DESTDIR/conf"
+printf '%s\n' "$ports" > "$DESTDIR/conf/pci-pf-bar-rebalance"
+if [ -n "$ensure_id" ]; then
+    printf '%s\n' "$ensure_id" > "$DESTDIR/conf/pci-pf-bar-ensure-id"
+else
+    rm -f "$DESTDIR/conf/pci-pf-bar-ensure-id"
+fi
+# Wrap only the generated initrd copy, never the host's vendor udev script.
+cp -p "$DESTDIR/scripts/init-top/udev" "$DESTDIR/lib/pci-pf-bar-recover/udev.original"
+cp /usr/share/pci-pf-bar-recover/early-udev-wrapper "$DESTDIR/scripts/init-top/udev"
+cp /usr/share/pci-pf-bar-recover/run-early "$DESTDIR/lib/pci-pf-bar-recover/run-early"
+chmod 755 "$DESTDIR/scripts/init-top/udev" "$DESTDIR/lib/pci-pf-bar-recover/run-early"

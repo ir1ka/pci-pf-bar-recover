@@ -1,0 +1,3 @@
+PCI PF BAR Recover
+
+完整用户手册见同目录 README.md。安装默认关闭自动恢复；必须显式执行 pci-pf-bar-boot enable。

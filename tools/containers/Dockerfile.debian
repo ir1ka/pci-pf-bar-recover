@@ -1,0 +1,9 @@
+# Build/test environment only. Target headers are mounted read-only explicitly.
+FROM debian:13
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential gcc-14 g++-14 python3 git debhelper dh-sequence-dkms dkms kmod \
+    initramfs-tools busybox-static cpio gzip xz-utils zstd qemu-system-x86 \
+    libelf-dev libssl-dev patch ca-certificates && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1
+# Debian's target kernel enables module BTF; keep this tool in the builder too.
+RUN apt-get update && apt-get install -y --no-install-recommends pahole && rm -rf /var/lib/apt/lists/*

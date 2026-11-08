@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+#DEBHELPER#
+# Fresh install has no opt-in file and does not rebuild an enabled early hook.
+# Upgrades preserve a previous explicit opt-in, after DKMS has built the modules.
+if [ "${1:-}" = configure ] && [ -f /etc/initramfs-tools/conf.d/pci-pf-bar-rebalance ]; then
+    update-initramfs -u -k all
+elif [ "${1:-}" = configure ] && [ -f /var/lib/pci-pf-bar-recover/early-image-state ]; then
+    /usr/sbin/pci-pf-bar-boot disable
+fi

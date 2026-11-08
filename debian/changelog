@@ -1,0 +1,5 @@
+pci-pf-bar-recover (2.5.1-4) unstable; urgency=medium
+
+  * Initial public source release.
+
+ -- IriKa Qiu <qiujie.jq@gmail.com>  Sun, 08 Nov 2026 12:00:00 +0000

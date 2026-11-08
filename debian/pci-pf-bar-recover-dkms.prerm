@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+# Remove an explicitly enabled action from images BEFORE DKMS files disappear.
+case ${1:-} in
+    remove|deconfigure)
+        if { [ -f /etc/initramfs-tools/conf.d/pci-pf-bar-rebalance ] || [ -f /var/lib/pci-pf-bar-recover/early-image-state ]; }; then
+            /usr/sbin/pci-pf-bar-boot disable
+        fi
+        ;;
+esac
+#DEBHELPER#

@@ -1,0 +1,11 @@
+bin/pci-pf-bar-recover usr/sbin
+src/pci_pf_bar_recover.c usr/src/pci-pf-bar-recover-2.5.1/src
+src/Makefile usr/src/pci-pf-bar-recover-2.5.1/src
+src/rebalance.inc usr/src/pci-pf-bar-recover-2.5.1/src
+bin/pci-pf-bar-boot usr/sbin
+initramfs/pci-pf-bar-rebalance usr/share/initramfs-tools/hooks
+lib/early-udev-wrapper usr/share/pci-pf-bar-recover
+lib/run-early usr/share/pci-pf-bar-recover
+bin/pci-pf-bar-power usr/sbin
+src/bar_policy.inc usr/src/pci-pf-bar-recover-2.5.1/src
+lib/initramfs-runtime usr/share/pci-pf-bar-recover

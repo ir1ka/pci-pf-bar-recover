@@ -1,0 +1,7 @@
+#!/bin/sh
+# Retain the vendor script's prerequisite declaration and arguments.
+case ${1:-} in
+    prereqs) exec /lib/pci-pf-bar-recover/udev.original "$@";;
+esac
+/bin/sh /lib/pci-pf-bar-recover/run-early || :
+exec /lib/pci-pf-bar-recover/udev.original "$@"
