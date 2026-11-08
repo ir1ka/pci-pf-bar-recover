@@ -1,3 +1,4 @@
 PCI PF BAR Recover
 
-完整用户手册见同目录 README.md。安装默认关闭自动恢复；必须显式执行 pci-pf-bar-boot enable。
+See README.md for the English user manual or README.zh-CN.md for Chinese.
+Automatic boot recovery is disabled by default; explicitly run pci-pf-bar-boot enable to opt in.

@@ -101,7 +101,7 @@ def package(a,p):
         copy(ROOT/'lib/initramfs-runtime','usr/share/pci-pf-bar-recover/initramfs-runtime',0o644)
         for name in ('early-udev-wrapper','run-early'):copy(ROOT/'lib'/name,'usr/share/pci-pf-bar-recover/'+name,0o755)
         (stage/'usr/share/pci-pf-bar-recover/prebuilt-kernels').write_text(a.kernel+'\n')
-        for src,name in [('README.md','README.md'),('README.Debian','README.Debian'),('LICENSE','COPYING'),('debian/copyright','copyright')]:
+        for src,name in [('README.md','README.md'),('README.zh-CN.md','README.zh-CN.md'),('README.Debian','README.Debian'),('LICENSE','COPYING'),('debian/copyright','copyright')]:
             copy(ROOT/src,'usr/share/doc/pci-pf-bar-recover-prebuilt/'+name,0o644)
         control=stage/'DEBIAN';control.mkdir()
         from file_guard import text as ownership_guard

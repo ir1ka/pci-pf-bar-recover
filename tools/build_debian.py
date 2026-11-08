@@ -10,7 +10,7 @@ import tempfile
 
 ROOT=Path(__file__).resolve().parents[1]
 DIRECTORIES=('src','bin','lib','initramfs','tests','debian','tools')
-FILES=('LICENSE','README.md','README.Debian','Makefile','dkms.conf','.gitignore','.gitattributes')
+FILES=('LICENSE','README.md','README.zh-CN.md','README.Debian','Makefile','dkms.conf','.gitignore','.gitattributes')
 PATTERNS=('*.ko','*.ko.*','*.o','*.mod','*.mod.c','.*.cmd','Module.symvers','modules.order','*.pyc','*.log')
 
 def ignore(path,names):
